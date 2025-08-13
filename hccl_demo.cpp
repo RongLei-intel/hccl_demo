@@ -93,7 +93,6 @@ double benchmark(const EnvData&                       envData,
                  const std::function<void(uint64_t)>& fn,
                  const std::function<void()>&         fnCorrectness)
 {
-    float rankDurationInSec;
 
     // Run warmup iterations to sync all the gaudis on the device.
     size_t iterations = 1;
@@ -111,21 +110,33 @@ double benchmark(const EnvData&                       envData,
     CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
 
     // Actual iterations
-    auto startTime = std::chrono::high_resolution_clock::now();
-
-    for (size_t iter = 1; iter < envData.numIters; ++iter)
+    synEventHandle timeStart, timeStop;
+    CHECK_SYNAPSE_STATUS(synEventCreate(&timeStart, envData.rank, 1));
+    CHECK_SYNAPSE_STATUS(synEventCreate(&timeStop, envData.rank, 1));
+    
+    double totalDurationInSec = 0;
+    uint64_t iterDurationInNano = 0;
+    for (size_t iter = 0; iter < envData.numIters; ++iter)
     {
+
+        CHECK_SYNAPSE_STATUS(synEventRecord(timeStart, resources.collectiveStream));
         fn(iter);
+        CHECK_SYNAPSE_STATUS(synEventRecord(timeStop, resources.collectiveStream));
+        CHECK_SYNAPSE_STATUS(synEventSynchronize(timeStop));
+        
+        CHECK_SYNAPSE_STATUS(synEventElapsedTime(&iterDurationInNano, timeStart, timeStop));
+        CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
+        
+        double iterDurationInSec = static_cast<double>(iterDurationInNano) / 1e9;
+        totalDurationInSec += iterDurationInSec;
+
     }
+
+    // Calculate average duration
+    double rankDurationInSec = totalDurationInSec / envData.numIters;
 
     // Correctness run on separate device output buffer
     fnCorrectness();
-
-    CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
-
-    const auto duration = std::chrono::high_resolution_clock::now() - startTime;
-    rankDurationInSec   = std::chrono::duration_cast<std::chrono::duration<double>>(duration).count();
-    rankDurationInSec   = rankDurationInSec / envData.numIters;
 
     return rankDurationInSec;
 }
