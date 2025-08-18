@@ -137,6 +137,7 @@ double benchmark(const EnvData&                       envData,
 
     // Correctness run on separate device output buffer
     fnCorrectness();
+    CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
 
     return rankDurationInSec;
 }
