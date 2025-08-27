@@ -88,7 +88,7 @@ std::stringstream get_affinity_level()
 // Constants
 static constexpr size_t MAX_PRINTED_BUFFER_ELEMENTS = 4;
 
-double benchmark(const EnvData&                       envData,
+double benchmark_latency(const EnvData&                       envData,
                  const DeviceResources&               resources,
                  const std::function<void(uint64_t)>& fn,
                  const std::function<void()>&         fnCorrectness)
@@ -140,6 +140,48 @@ double benchmark(const EnvData&                       envData,
     CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
 
     return rankDurationInSec;
+}
+
+double benchmark(const EnvData&                       envData,
+    const DeviceResources&               resources,
+    const std::function<void(uint64_t)>& fn,
+    const std::function<void()>&         fnCorrectness)
+{
+float rankDurationInSec;
+
+// Run warmup iterations to sync all the gaudis on the device.
+size_t iterations = 1;
+char   default_gdr_input[128];
+synConfigurationGet("HCCL_GAUDI_DIRECT", default_gdr_input, sizeof(default_gdr_input));
+if (default_gdr_input[0] == '1')
+{
+iterations = MAX_BUFFER_COUNT;
+}
+for (size_t warmup_iter = 0; warmup_iter < iterations; ++warmup_iter)
+{
+fn(warmup_iter);
+}
+
+CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
+
+// Actual iterations
+auto startTime = std::chrono::high_resolution_clock::now();
+
+for (size_t iter = 1; iter < envData.numIters; ++iter)
+{
+fn(iter);
+}
+
+// Correctness run on separate device output buffer
+fnCorrectness();
+
+CHECK_SYNAPSE_STATUS(synStreamSynchronize(resources.collectiveStream));
+
+const auto duration = std::chrono::high_resolution_clock::now() - startTime;
+rankDurationInSec   = std::chrono::duration_cast<std::chrono::duration<double>>(duration).count();
+rankDurationInSec   = rankDurationInSec / envData.numIters;
+
+return rankDurationInSec;
 }
 
 static void initMPI()
@@ -808,25 +850,57 @@ static void collectiveTestDriver(const EnvData&         envData,
         return;
     }
 
-    // Run HCCL collective
-    stats.rankDurationInSec = benchmark(
-        envData,
-        resources,
-        [&](uint64_t iter) {
-            uint64_t index = iter % buffers.inputDevPtrs.size();
-            collective(envData,
-                       resources,
-                       (const void*)buffers.inputDevPtrs[index],
-                       (void*)buffers.outputDevPtrs[index],
-                       buffers.inputSize / getDataTypeSize(envData));
-        },
-        [&]() {
-            collective(envData,
-                       resources,
-                       (const void*)buffers.inputDevPtrs[0],
-                       (void*)buffers.correctnessDevPtr,
-                       buffers.inputSize / getDataTypeSize(envData));
-        });
+    // Choose benchmark function based on latency benchmark setting
+    bool useLatencyBenchmark = false;
+    const char* latencyEnv = getenv("HCCL_DEMO_LATENCY_BENCHMARK");
+    if (latencyEnv && latencyEnv[0] == '1')
+    {
+        useLatencyBenchmark = true;
+    }
+
+    // Run HCCL collective with appropriate benchmark function
+    if (useLatencyBenchmark)
+    {
+        stats.rankDurationInSec = benchmark_latency(
+            envData,
+            resources,
+            [&](uint64_t iter) {
+                uint64_t index = iter % buffers.inputDevPtrs.size();
+                collective(envData,
+                           resources,
+                           (const void*)buffers.inputDevPtrs[index],
+                           (void*)buffers.outputDevPtrs[index],
+                           buffers.inputSize / getDataTypeSize(envData));
+            },
+            [&]() {
+                collective(envData,
+                           resources,
+                           (const void*)buffers.inputDevPtrs[0],
+                           (void*)buffers.correctnessDevPtr,
+                           buffers.inputSize / getDataTypeSize(envData));
+            });
+    }
+    else
+    {
+        stats.rankDurationInSec = benchmark(
+            envData,
+            resources,
+            [&](uint64_t iter) {
+                uint64_t index = iter % buffers.inputDevPtrs.size();
+                collective(envData,
+                           resources,
+                           (const void*)buffers.inputDevPtrs[index],
+                           (void*)buffers.outputDevPtrs[index],
+                           buffers.inputSize / getDataTypeSize(envData));
+            },
+            [&]() {
+                collective(envData,
+                           resources,
+                           (const void*)buffers.inputDevPtrs[0],
+                           (void*)buffers.correctnessDevPtr,
+                           buffers.inputSize / getDataTypeSize(envData));
+            });
+    }
 
     if (envData.shouldCheckCorrectness)
     {
@@ -839,7 +913,7 @@ static void collectiveTestDriver(const EnvData&         envData,
     }
 }
 
-static void printReport(const EnvData& envData, const std::vector<ReportEntry>& reportVec)
+static void printReport(const EnvData& envData, const std::vector<ReportEntry>& reportVec, bool isLatencyBenchmark = false)
 {
     constexpr size_t columnWidth = 14;
 
@@ -847,9 +921,11 @@ static void printReport(const EnvData& envData, const std::vector<ReportEntry>& 
     const static std::vector<std::string> units  = {"(B)", "(elements)", "", "", "(ms)", "(GB/s)", "(GB/s)"};
 
     std::stringstream ss;
-    const std::string summary = "[SUMMARY REPORT]";
+    const std::string benchmarkType = isLatencyBenchmark ? "LATENCY" : "THROUGHPUT";
+    const std::string summary = "[" + benchmarkType + " BENCHMARK SUMMARY REPORT]";
     const std::string statName =
-        "(src!=dst, collective=" + envData.testType + ", iterations=" + std::to_string(envData.numIters) + ")";
+        "(src!=dst, collective=" + envData.testType + ", iterations=" + std::to_string(envData.numIters) + 
+        ", benchmark_type=" + benchmarkType + ")";
     size_t delimiterSize = statName.length() + 1;
     ss << '\n' << getPrintDelimiter(delimiterSize, '#') << std::endl;
     ss << summary << '\n' << statName << '\n' << std::endl;
@@ -922,6 +998,14 @@ template<class T>
 static void runTest(EnvData& envData, const DeviceResources& resources)
 {
     bool isOK = true;
+    bool isLatencyBenchmark = false;
+
+    // Check if latency benchmark is enabled
+    const char* latencyEnv = getenv("HCCL_DEMO_LATENCY_BENCHMARK");
+    if (latencyEnv && latencyEnv[0] == '1')
+    {
+        isLatencyBenchmark = true;
+    }
 
     std::vector<ReportEntry> reportVec;
     for (double size = envData.sizeMin; size <= envData.sizeMax; size *= pow(2, envData.sizeInc))
@@ -969,7 +1053,7 @@ static void runTest(EnvData& envData, const DeviceResources& resources)
 
     if (reportVec.size() > 0)
     {
-        printReport(envData, reportVec);
+        printReport(envData, reportVec, isLatencyBenchmark);
     }
 
     if (!isOK) throw std::runtime_error {"Collective operation has failed on correctness."};
